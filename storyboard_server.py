@@ -19,6 +19,15 @@ from PIL import Image
 import torch
 import traceback
 
+# 導入framepack_start_end.py中的功能
+try:
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from framepack_start_end import process_video as framepack_process_video
+    print("成功導入framepack_start_end模組")
+except ImportError as e:
+    print(f"無法導入framepack_start_end模組: {e}")
+    framepack_process_video = None
+
 # 設置日誌
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -82,79 +91,79 @@ def process_video_task(task_id, start_image_path, end_image_path=None, params=No
         
         logger.info(f"開始處理任務 {task_id}，起始幀：{start_image_path}, 結束幀：{end_image_path}")
         
-        # 加載圖像
-        start_img = Image.open(start_image_path)
-        start_img_np = np.array(start_img)
-        
-        end_img_np = None
-        if end_image_path and os.path.exists(end_image_path):
-            end_img = Image.open(end_image_path)
-            end_img_np = np.array(end_img)
-        
-        # 更新狀態
-        task_status[task_id]["progress"] = 10
-        task_status[task_id]["message"] = "載入圖片完成，準備模型..."
-        
-        # 準備影片輸出路徑
-        output_filename = os.path.join(VIDEO_OUTPUT_DIR, f"{task_id}.mp4")
-        
         # 檢查是否應該停止處理
         if stop_processing:
             task_status[task_id]["status"] = "cancelled"
             task_status[task_id]["message"] = "任務被取消"
             return None
         
-        # 如果有Python執行檔案路徑，則使用subprocess調用
-        python_path = sys.executable
-        script_path = "demo_gradio_start_end.py"
+        # 準備輸出文件名
+        output_filename = os.path.join(VIDEO_OUTPUT_DIR, f"{task_id}.mp4")
         
-        # 構建命令參數
-        cmd_args = [
-            python_path,
-            script_path,
-            "--server", "127.0.0.1",
-            "--headless",  # 假設我們添加了一個無頭模式標誌
-            "--start_image", start_image_path
-        ]
-        
-        if end_image_path:
-            cmd_args.extend(["--end_image", end_image_path])
-        
-        cmd_args.extend([
-            "--prompt", actual_params["prompt"],
-            "--seed", str(actual_params["seed"]),
-            "--total_second_length", str(actual_params["total_second_length"]),
-            "--steps", str(actual_params["steps"]),
-            "--gs", str(actual_params["gs"]),
-            "--output", output_filename
-        ])
-        
-        if actual_params["use_teacache"]:
-            cmd_args.append("--use_teacache")
-        
-        # 模擬處理過程
-        for progress in range(10, 101, 10):
-            if stop_processing:
-                task_status[task_id]["status"] = "cancelled"
-                task_status[task_id]["message"] = "任務被取消"
+        # 使用framepack_start_end.py中的功能
+        if framepack_process_video:
+            # 使用自定義進度回調來更新任務狀態
+            def progress_callback(percentage, message):
+                task_status[task_id]["progress"] = percentage
+                task_status[task_id]["message"] = message
+                logger.info(f"任務 {task_id} 進度: {percentage}% - {message}")
+            
+            # 調用framepack_start_end.py中的處理函數
+            logger.info(f"使用framepack_process_video處理任務 {task_id}")
+            result = framepack_process_video(
+                start_image_path, 
+                end_image_path, 
+                progress_callback=progress_callback,
+                prompt=actual_params["prompt"],
+                n_prompt=actual_params["n_prompt"],
+                seed=actual_params["seed"],
+                total_second_length=actual_params["total_second_length"],
+                latent_window_size=actual_params["latent_window_size"],
+                steps=actual_params["steps"],
+                cfg=actual_params["cfg"],
+                gs=actual_params["gs"],
+                rs=actual_params["rs"],
+                gpu_memory_preservation=actual_params["gpu_memory_preservation"],
+                use_teacache=actual_params["use_teacache"],
+                mp4_crf=actual_params["mp4_crf"],
+                output=output_filename
+            )
+            
+            if result:
+                task_status[task_id]["status"] = "completed"
+                task_status[task_id]["progress"] = 100
+                task_status[task_id]["message"] = "處理完成！"
+                task_status[task_id]["output_file"] = result
+                logger.info(f"任務 {task_id} 處理完成，輸出文件: {result}")
+                return result
+            else:
+                task_status[task_id]["status"] = "error"
+                task_status[task_id]["message"] = "處理失敗"
+                logger.error(f"任務 {task_id} 處理失敗")
                 return None
-                
-            task_status[task_id]["progress"] = progress
-            task_status[task_id]["message"] = f"處理中... {progress}%"
-            time.sleep(1)  # 模擬處理時間
-        
-        # 在實際環境中，會通過subprocess運行模型：
-        # process = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        # stdout, stderr = process.communicate()
-        
-        # 完成處理
-        task_status[task_id]["status"] = "completed"
-        task_status[task_id]["progress"] = 100
-        task_status[task_id]["message"] = "處理完成！"
-        task_status[task_id]["output_file"] = output_filename
-        
-        logger.info(f"任務 {task_id} 處理完成，輸出文件: {output_filename}")
-        return output_filename
+        else:
+            # 如果無法導入framepack_process_video，則使用原始的模擬處理
+            logger.warning(f"無法使用framepack_process_video，將使用模擬處理")
+            
+            # 模擬處理過程
+            for progress in range(10, 101, 10):
+                if stop_processing:
+                    task_status[task_id]["status"] = "cancelled"
+                    task_status[task_id]["message"] = "任務被取消"
+                    return None
+                    
+                task_status[task_id]["progress"] = progress
+                task_status[task_id]["message"] = f"處理中... {progress}%"
+                time.sleep(1)  # 模擬處理時間
+            
+            # 完成處理
+            task_status[task_id]["status"] = "completed"
+            task_status[task_id]["progress"] = 100
+            task_status[task_id]["message"] = "處理完成！"
+            task_status[task_id]["output_file"] = output_filename
+            
+            logger.info(f"任務 {task_id} 處理完成，輸出文件: {output_filename}")
+            return output_filename
         
     except Exception as e:
         logger.error(f"處理任務 {task_id} 出錯: {e}")
