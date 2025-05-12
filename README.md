@@ -4,6 +4,7 @@
 下載方式：下載FramePack，然後將本專案的demo_gradio_start_end.py、storyboard.html、storyboard_server.py放入webui資料夾
 使用方式：將run.bat中執行的python檔案換成storyboard_server.py
 (5/12為虛擬版本暫時只支援UI測試功能)
+
 <p align="center">
     <img src="https://github.com/user-attachments/assets/2cc030b4-87e1-40a0-b5bf-1b7d6b62820b" width="300">
 </p>
