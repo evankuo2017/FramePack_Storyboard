@@ -1,3 +1,9 @@
+# FramePack Storyboard
+為FramePack新增Storyboard功能來更好的產出所想要的影片，目前利用加入最後幀功能的FramePack來實現
+在Storyboard中可以隨意在120秒的時間內指定10個節點，每個節點指定影片幀，每個節點間下達文字prompt
+下載方式：下載FramePack，然後將本專案的demo_gradio_start_end.py、storyboard.html、storyboard_server.py放入webui資料夾
+使用方式：將run.bat中執行的python檔案換成storyboard_server.py
+(5/12為虛擬版本暫時只支援UI測試功能)
 <p align="center">
     <img src="https://github.com/user-attachments/assets/2cc030b4-87e1-40a0-b5bf-1b7d6b62820b" width="300">
 </p>
