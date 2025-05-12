@@ -5,7 +5,9 @@
 在Storyboard中可以隨意在120秒的時間內指定10個節點，每個節點指定影片幀，每個節點間下達文字prompt
 
 # 下載方式：
-下載FramePack，然後將本專案的framepack_start_end.py、storyboard.html、storyboard_server.py放入webui資料夾
+下載FramePack，並執行一次run.bat確保原本的FramePack正常執行
+
+然後將本專案的framepack_start_end.py、storyboard.html、storyboard_server.py放入webui資料夾
 
 # 使用方式：
 將run.bat中執行的python檔案換成storyboard_server.py
