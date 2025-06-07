@@ -45,7 +45,6 @@ for dir_path in [OUTPUT_DIR, JSON_OUTPUT_DIR, IMAGE_OUTPUT_DIR, VIDEO_OUTPUT_DIR
 
 # 任務隊列和處理狀態
 task_queue = queue.Queue()
-current_task = None
 task_status = {}  # 存儲任務狀態的字典
 stop_processing = False
 
@@ -142,28 +141,12 @@ def process_video_task(task_id, start_image_path, end_image_path=None, params=No
                 logger.error(f"任務 {task_id} 處理失敗")
                 return None
         else:
-            # 如果無法導入framepack_process_video，則使用原始的模擬處理
-            logger.warning(f"無法使用framepack_process_video，將使用模擬處理")
-            
-            # 模擬處理過程
-            for progress in range(10, 101, 10):
-                if stop_processing:
-                    task_status[task_id]["status"] = "cancelled"
-                    task_status[task_id]["message"] = "任務被取消"
-                    return None
-                    
-                task_status[task_id]["progress"] = progress
-                task_status[task_id]["message"] = f"處理中... {progress}%"
-                time.sleep(1)  # 模擬處理時間
-            
-            # 完成處理
-            task_status[task_id]["status"] = "completed"
-            task_status[task_id]["progress"] = 100
-            task_status[task_id]["message"] = "處理完成！"
-            task_status[task_id]["output_file"] = output_filename
-            
-            logger.info(f"任務 {task_id} 處理完成，輸出文件: {output_filename}")
-            return output_filename
+            # 如果無法導入framepack_process_video，則標記任務為錯誤
+            logger.error(f"任務 {task_id} 無法處理: framepack_process_video 模組未成功導入。")
+            task_status[task_id]["status"] = "error"
+            task_status[task_id]["message"] = "處理模組不可用 (framepack_process_video missing)"
+            task_status[task_id]["progress"] = 0 # 確保進度為0
+            return None
         
     except Exception as e:
         logger.error(f"處理任務 {task_id} 出錯: {e}")
@@ -174,7 +157,7 @@ def process_video_task(task_id, start_image_path, end_image_path=None, params=No
 
 # 任務處理線程
 def task_processor():
-    global current_task, task_status, stop_processing
+    global task_status, stop_processing
     
     logger.info("任務處理線程已啟動")
     
@@ -183,7 +166,6 @@ def task_processor():
             # 從隊列獲取任務，非阻塞
             try:
                 task = task_queue.get(block=False)
-                current_task = task
                 task_id = task.get("id")
                 logger.info(f"開始處理任務: {task_id}")
                 
@@ -199,7 +181,6 @@ def task_processor():
                 
             except queue.Empty:
                 # 隊列為空，等待
-                current_task = None
                 time.sleep(1)
                 continue
                 
@@ -427,6 +408,68 @@ class StoryboardHandler(http.server.SimpleHTTPRequestHandler):
                 })
                 
             self.wfile.write(response.encode('utf-8'))
+            return
+
+        # 新增：處理讀取特定故事板JSON文件的請求
+        elif path == '/load_storyboard':
+            query_components = urllib.parse.parse_qs(parsed_path.query)
+            filename = query_components.get('file', [None])[0]
+
+            if not filename:
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                response_data = {"status": "error", "message": "Filename parameter is missing"}
+                self.wfile.write(json.dumps(response_data).encode('utf-8'))
+                return
+
+            # 安全性檢查，防止路徑遍歷
+            if '..' in filename or filename.startswith('/') or filename.startswith('\\\\'):
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                response_data = {"status": "error", "message": "Invalid filename"}
+                self.wfile.write(json.dumps(response_data).encode('utf-8'))
+                return
+
+            file_path = os.path.join(JSON_OUTPUT_DIR, filename)
+
+            if not os.path.exists(file_path):
+                self.send_response(404)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                # logger.info(f"Debug: Attempting to load file from: {os.path.abspath(file_path)}")
+                response_data = {"status": "error", "message": f"Storyboard file '{filename}' not found at path: {file_path}"}
+                self.wfile.write(json.dumps(response_data).encode('utf-8'))
+                return
+            
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps(data).encode('utf-8')) # 直接返回JSON檔案的內容
+            
+            except json.JSONDecodeError as e:
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                response_data = {"status": "error", "message": f"Error decoding JSON from file '{filename}': {str(e)}"}
+                self.wfile.write(json.dumps(response_data).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                response_data = {"status": "error", "message": f"Error loading storyboard file: {str(e)}"}
+                self.wfile.write(json.dumps(response_data).encode('utf-8'))
             return
         
         # 視頻文件提供

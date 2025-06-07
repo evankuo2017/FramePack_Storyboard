@@ -226,8 +226,20 @@ def process_video(start_image_path, end_image_path=None, progress_callback=None,
         progress.update(0, 'Processing start frame ...')
         
         input_image = Image.open(start_image_path)
+        # 確保影像是RGB格式
+        if input_image.mode != "RGB":
+            print(f"Info: 正在將起始影像 {start_image_path} 從模式 {input_image.mode} 轉換為 RGB。")
+            input_image = input_image.convert("RGB")
         input_image_np = np.array(input_image)
-        H, W, C = input_image_np.shape
+
+        # 在此，input_image_np 應該是 H, W, 3 的形式
+        # 作為最後的防護，檢查維度和通道
+        if input_image_np.ndim != 3 or input_image_np.shape[-1] != 3:
+            error_msg = f"錯誤: 起始影像 {start_image_path} 在RGB轉換後的 NumPy 陣列維度不正確: {input_image_np.shape} (預期 3 維且最後維度為 3)"
+            print(error_msg)
+            raise ValueError(error_msg)
+
+        H, W, C = input_image_np.shape # 現在這行應該可以正常工作
         height, width = find_nearest_bucket(H, W, resolution=640)
         input_image_np = resize_and_center_crop(input_image_np, target_width=width, target_height=height)
         
@@ -241,10 +253,28 @@ def process_video(start_image_path, end_image_path=None, progress_callback=None,
         if has_end_image:
             progress.update(0, 'Processing end frame ...')
             
-            end_image = Image.open(end_image_path)
-            end_image_np = np.array(end_image)
+            try:
+                img_pil = Image.open(end_image_path)
+                # 確保影像是RGB格式
+                if img_pil.mode != "RGB":
+                    print(f"Info: 正在將結束影像 {end_image_path} 從模式 {img_pil.mode} 轉換為 RGB。")
+                    img_pil = img_pil.convert("RGB")
+                end_image_np = np.array(img_pil)
+            except Exception as e:
+                print(f"錯誤: 無法開啟或轉換結束影像 {end_image_path} 為 RGB NumPy 陣列: {e}")
+                # 可以選擇重新引發異常，或設定 has_end_image = False，或返回錯誤狀態
+                # 此處重新引發異常，讓呼叫方 (storyboard_server.py) 處理
+                raise 
+
+            # 在此，end_image_np 應該是 H, W, 3 的形式
+            # 作為最後的防護，檢查維度和通道
+            if end_image_np.ndim != 3 or end_image_np.shape[-1] != 3:
+                error_msg = f"錯誤: 結束影像 {end_image_path} 在RGB轉換後的 NumPy 陣列維度不正確: {end_image_np.shape} (預期 3 維且最後維度為 3)"
+                print(error_msg)
+                raise ValueError(error_msg)
+
+            H_end, W_end, C_end = end_image_np.shape # 現在這行應該可以正常工作
             
-            H_end, W_end, C_end = end_image_np.shape
             end_image_np = resize_and_center_crop(end_image_np, target_width=width, target_height=height)
             
             Image.fromarray(end_image_np).save(os.path.join(outputs_folder, f'{job_id}_end.png'))
