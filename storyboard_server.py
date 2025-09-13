@@ -13,7 +13,9 @@ import time
 import mimetypes
 import subprocess
 import queue
+import uuid
 import sys
+import random
 import numpy as np
 from PIL import Image
 import torch
@@ -32,21 +34,27 @@ except ImportError as e:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# 確保輸出目錄存在
+# 確保基礎輸出目錄存在
 OUTPUT_DIR = "storyboard_outputs"
-JSON_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "json_output")
-IMAGE_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "image_output")
-VIDEO_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "video_output")
 
-for dir_path in [OUTPUT_DIR, JSON_OUTPUT_DIR, IMAGE_OUTPUT_DIR, VIDEO_OUTPUT_DIR]:
-    if not os.path.exists(dir_path):
-        os.makedirs(dir_path)
-        logger.info(f"創建目錄: {dir_path}")
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
+    logger.info(f"創建基礎目錄: {OUTPUT_DIR}")
+
+# 輔助函數：創建專案資料夾結構
+def create_project_structure(project_folder):
+    """創建專案資料夾及其子資料夾"""
+    image_folder = os.path.join(project_folder, "images")
+    os.makedirs(project_folder, exist_ok=True)
+    os.makedirs(image_folder, exist_ok=True)
+    return image_folder
 
 # 任務隊列和處理狀態
 task_queue = queue.Queue()
 task_status = {}  # 存儲任務狀態的字典
 stop_processing = False
+preview_jobs = {}
+preview_cancel_flags = {}
 
 # 配置參數
 default_params = {
@@ -64,8 +72,223 @@ default_params = {
     "mp4_crf": 16
 }
 
+def create_tasks_from_nodes_and_transitions_direct(nodes, transitions, project_folder):
+    """
+    直接從節點和轉場數據創建視頻處理任務（用於重新生成）
+    
+    Args:
+        nodes: 節點數據列表
+        transitions: 轉場數據列表
+        project_folder: 現有的專案資料夾路徑
+    
+    Returns:
+        添加的任務ID列表，或錯誤信息
+    """
+    try:
+        job_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        project_image_folder = os.path.join(project_folder, "images")
+        
+        if len(nodes) < 2:
+            error_msg = f"節點少於2個，無法創建任務"
+            logger.warning(error_msg)
+            return {"success": False, "message": "需要至少2個節點才能生成影片。"}
+        
+        # 檢查所有節點是否都有圖片
+        logger.info(f"檢查重生任務的圖片，專案圖片資料夾: {project_image_folder}")
+        
+        # 列出專案圖片資料夾中的所有文件
+        if os.path.exists(project_image_folder):
+            available_images = os.listdir(project_image_folder)
+            logger.info(f"專案圖片資料夾中的文件: {available_images}")
+        else:
+            logger.error(f"專案圖片資料夾不存在: {project_image_folder}")
+            return {"success": False, "message": f"專案圖片資料夾不存在: {project_image_folder}"}
+        
+        missing_images = []
+        node_image_paths = {}  # 儲存每個節點的實際圖片路徑
+        
+        for i, node in enumerate(nodes):
+            has_image = node.get("hasImage", False)
+            image_path = node.get("imagePath")
+            
+            logger.info(f"檢查節點 {i}: hasImage={has_image}, imagePath={image_path}")
+            
+            if not has_image:
+                missing_images.append(i)
+                logger.warning(f"節點 {i} 標記為沒有圖片")
+                continue
+            
+            # 嘗試多種方式找到圖片文件
+            found_image = None
+            
+            # 方法1: 如果提供了 imagePath，嘗試使用它
+            if image_path:
+                # 嘗試直接使用 imagePath（可能是文件名）
+                full_path = os.path.join(project_image_folder, os.path.basename(image_path))
+                if os.path.exists(full_path):
+                    found_image = full_path
+                    logger.info(f"節點 {i} 找到圖片（方法1-basename）: {full_path}")
+                else:
+                    # 嘗試直接使用 imagePath
+                    alt_path = os.path.join(project_image_folder, image_path)
+                    if os.path.exists(alt_path):
+                        found_image = alt_path
+                        logger.info(f"節點 {i} 找到圖片（方法1-direct）: {alt_path}")
+            
+            # 方法2: 如果還沒找到，嘗試常見的命名模式
+            if not found_image:
+                common_patterns = [
+                    f"node_{i}.png",
+                    f"node_{i}.jpg",
+                    f"node_{i}.jpeg",
+                    f"{i}.png",
+                    f"{i}.jpg",
+                    f"{i}.jpeg"
+                ]
+                
+                for pattern in common_patterns:
+                    test_path = os.path.join(project_image_folder, pattern)
+                    if os.path.exists(test_path):
+                        found_image = test_path
+                        logger.info(f"節點 {i} 找到圖片（方法2-pattern）: {found_image}")
+                        break
+            
+            # 方法3: 如果還沒找到，按索引順序查找圖片文件
+            if not found_image:
+                image_files = [f for f in available_images if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                image_files.sort()  # 確保順序一致
+                
+                if i < len(image_files):
+                    found_image = os.path.join(project_image_folder, image_files[i])
+                    logger.info(f"節點 {i} 找到圖片（方法3-index）: {found_image}")
+            
+            if found_image:
+                node_image_paths[i] = found_image
+                logger.info(f"節點 {i} 最終使用圖片: {found_image}")
+            else:
+                missing_images.append(i)
+                logger.warning(f"節點 {i} 找不到任何圖片文件")
+        
+        if missing_images:
+            error_msg = f"節點 {missing_images} 缺少圖片文件"
+            logger.error(error_msg)
+            return {"success": False, "message": f"節點 {missing_images} 缺少圖片文件"}
+        
+        task_ids = []
+        
+        # 為每相鄰的節點對創建任務
+        for i in range(len(nodes) - 1):
+            start_node = nodes[i]
+            end_node = nodes[i + 1]
+            
+            # 使用我們之前找到的實際圖片路徑
+            start_image_path = node_image_paths.get(i)
+            end_image_path = node_image_paths.get(i + 1)
+            
+            if not start_image_path or not end_image_path:
+                logger.error(f"無法找到節點 {i} 或 {i+1} 的圖片路徑")
+                continue
+            
+            logger.info(f"重生任務 {i}->{i+1}: 起始圖片={start_image_path}, 結束圖片={end_image_path}")
+            
+            # 查找對應的轉場描述
+            transition_text = ""
+            for transition in transitions:
+                if transition.get("from_node") == i and transition.get("to_node") == i + 1:
+                    transition_text = transition.get("text", "")
+                    break
+            
+            # 重生時重用現有的 task ID，而不是創建新的
+            # 查找現有的 task ID
+            existing_task_id = None
+            if os.path.exists(project_folder):
+                for filename in os.listdir(project_folder):
+                    if filename.startswith(f"video_{i}_{i+1}_") and filename.endswith('.mp4'):
+                        existing_task_id = filename[:-4]  # 移除 .mp4 擴展名
+                        logger.info(f"找到現有任務 ID: {existing_task_id}")
+                        break
+            
+            # 如果找不到現有任務，創建新的
+            if existing_task_id:
+                task_id = existing_task_id
+                logger.info(f"重用現有任務 ID: {task_id}")
+            else:
+                timestamp = datetime.now().strftime("%H%M%S")
+                task_id = f"video_{i}_{i+1}_{timestamp}"
+                logger.info(f"創建新任務 ID: {task_id}")
+            
+            # 設置任務時長（基於節點時間差）
+            time_range = None
+            for transition in transitions:
+                if transition.get("from_node") == i and transition.get("to_node") == i + 1:
+                    time_range = transition.get("time_range")
+                    break
+            
+            second_length = 5  # 默認5秒
+            if time_range and len(time_range) >= 2:
+                second_length = max(0.1, float(time_range[1]) - float(time_range[0]))
+            
+            # 獲取 seed（從結束節點）
+            seed = end_node.get("seed", default_params["seed"])
+            if seed is None:
+                seed = random.randint(0, 2147483647)
+            
+            logger.info(f"創建重新生成任務 {task_id}: {start_image_path} -> {end_image_path}")
+            logger.info(f"  轉場描述: '{transition_text}'")
+            logger.info(f"  時長: {second_length} 秒")
+            logger.info(f"  Seed: {seed}")
+            
+            # 創建任務字典（與正常處理流程保持一致）
+            # 重生任務會直接覆蓋現有文件，不需要額外的刪除操作
+            task = {
+                "id": task_id,
+                "start_image": start_image_path,
+                "end_image": end_image_path,
+                "project_folder": project_folder,
+                "is_regenerate": True,  # 標記為重生任務
+                "params": {
+                    "prompt": transition_text,
+                    "seed": seed,
+                    "second_length": second_length
+                }
+            }
+            
+            # 將任務添加到隊列
+            task_queue.put(task)
+            
+            task_ids.append(task_id)
+            
+            # 初始化或更新任務狀態
+            if task_id in task_status:
+                # 如果任務已存在（重生情況），更新狀態但保留輸出文件信息
+                existing_output = task_status[task_id].get("output_file")
+                task_status[task_id] = {
+                    "status": "pending",
+                    "message": f"重生任務已創建，等待處理",
+                    "progress": 0,
+                    "output_file": existing_output  # 保留現有的輸出文件
+                }
+                logger.info(f"更新現有任務狀態: {task_id}")
+            else:
+                # 新任務
+                task_status[task_id] = {
+                    "status": "pending", 
+                    "message": f"任務已創建，等待處理",
+                    "progress": 0
+                }
+                logger.info(f"創建新任務狀態: {task_id}")
+        
+        logger.info(f"成功創建 {len(task_ids)} 個重新生成任務")
+        return {"success": True, "task_ids": task_ids}
+        
+    except Exception as e:
+        logger.error(f"創建重新生成任務時發生錯誤: {e}")
+        traceback.print_exc()
+        return {"success": False, "message": f"Error creating regeneration tasks: {str(e)}"}
+
+
 # 模擬 FramePack 處理函數
-def process_video_task(task_id, start_image_path, end_image_path=None, params=None):
+def process_video_task(task_id, start_image_path, end_image_path=None, params=None, project_folder=None):
     """
     處理視頻生成任務
     
@@ -74,6 +297,7 @@ def process_video_task(task_id, start_image_path, end_image_path=None, params=No
         start_image_path: 起始幀圖片路徑
         end_image_path: 結束幀圖片路徑 (可選)
         params: 其他參數字典
+        project_folder: 專案資料夾路徑
     """
     global task_status
     
@@ -96,8 +320,13 @@ def process_video_task(task_id, start_image_path, end_image_path=None, params=No
             task_status[task_id]["message"] = "任務被取消"
             return None
         
-        # 準備輸出文件名
-        output_filename = os.path.join(VIDEO_OUTPUT_DIR, f"{task_id}.mp4")
+        # 準備輸出文件名（使用專案資料夾）
+        if project_folder:
+            output_filename = os.path.join(project_folder, f"{task_id}.mp4")
+        else:
+            # 如果沒有專案資料夾，使用臨時目錄
+            import tempfile
+            output_filename = os.path.join(tempfile.gettempdir(), f"{task_id}.mp4")
         
         # 使用framepack_start_end.py中的功能
         if framepack_process_video:
@@ -173,8 +402,20 @@ def task_processor():
                 start_image = task.get("start_image")
                 end_image = task.get("end_image")
                 params = task.get("params", {})
+                project_folder = task.get("project_folder")
+                is_regenerate = task.get("is_regenerate", False)
                 
-                process_video_task(task_id, start_image, end_image, params)
+                # 如果是重生任務，重置任務狀態為等待中
+                if is_regenerate:
+                    task_status[task_id] = {
+                        "status": "queued",
+                        "progress": 0,
+                        "message": "重生任務已加入隊列",
+                        "output_file": task_status.get(task_id, {}).get("output_file")  # 保留原有的輸出文件信息
+                    }
+                    logger.info(f"重生任務 {task_id} 狀態重置為等待中")
+                
+                result = process_video_task(task_id, start_image, end_image, params, project_folder)
                 
                 # 標記任務完成
                 task_queue.task_done()
@@ -197,7 +438,7 @@ def create_tasks_from_storyboard(storyboard_file):
     從故事板JSON文件生成視頻處理任務
     
     Args:
-        storyboard_file: JSON文件路徑
+        storyboard_file: JSON文件路徑（已經在專案資料夾內）
     
     Returns:
         添加的任務ID列表，或錯誤信息
@@ -210,34 +451,14 @@ def create_tasks_from_storyboard(storyboard_file):
         nodes = data.get("nodes", [])
         transitions = data.get("transitions", [])
         
+        # 獲取專案資料夾路徑（JSON 文件已經在專案資料夾內）
+        project_folder = os.path.dirname(storyboard_file)
+        project_image_folder = os.path.join(project_folder, "images")
+        
         if len(nodes) < 2:
             error_msg = f"故事板 {storyboard_file} 節點少於2個，無法創建任務"
             logger.warning(error_msg)
             return {"success": False, "message": "Storyboard needs at least 2 nodes to generate videos."}
-        
-        # 檢查所有節點是否都有圖片
-        missing_images = []
-        for i, node in enumerate(nodes):
-            has_image = node.get("hasImage", False)
-            image_path = node.get("imagePath")
-            
-            if not has_image or not image_path:
-                missing_images.append(i)
-                continue
-                
-            # 檢查圖片文件是否存在
-            full_path = os.path.join(IMAGE_OUTPUT_DIR, image_path)
-            if not os.path.exists(full_path):
-                alt_path = os.path.join(IMAGE_OUTPUT_DIR, os.path.basename(image_path))
-                if not os.path.exists(alt_path):
-                    missing_images.append(i)
-        
-        # 如果有節點缺少圖片，返回錯誤
-        if missing_images:
-            nodes_str = ", ".join([str(i) for i in missing_images])
-            error_msg = f"節點 {nodes_str} 缺少圖片，請為所有節點添加圖片後再處理"
-            logger.warning(error_msg)
-            return {"success": False, "message": f"Nodes {nodes_str} are missing images. Please add images to all nodes before processing."}
         
         # 獲取節點圖像路徑
         task_ids = []
@@ -247,24 +468,18 @@ def create_tasks_from_storyboard(storyboard_file):
             start_node = nodes[i]
             end_node = nodes[i + 1]
             
-            # 獲取圖像路徑
+            # 獲取圖像路徑 - 直接在專案的 images 資料夾中查找
             start_image_path = start_node.get("imagePath")
-            
-            # 處理圖片路徑
             if start_image_path:
-                # 從文件名構建完整路徑
-                start_image_path = os.path.join(IMAGE_OUTPUT_DIR, os.path.basename(start_image_path))
-                
+                start_image_path = os.path.join(project_image_folder, os.path.basename(start_image_path))
                 if not os.path.exists(start_image_path):
                     logger.error(f"無法找到節點 {i} 的圖片: {start_image_path}")
                     continue
             
             # 處理結束節點圖像
             end_image_path = end_node.get("imagePath")
-            
             if end_image_path:
-                end_image_path = os.path.join(IMAGE_OUTPUT_DIR, os.path.basename(end_image_path))
-                
+                end_image_path = os.path.join(project_image_folder, os.path.basename(end_image_path))
                 if not os.path.exists(end_image_path):
                     logger.warning(f"無法找到節點 {i+1} 的圖片: {end_image_path}")
                     end_image_path = None
@@ -276,8 +491,9 @@ def create_tasks_from_storyboard(storyboard_file):
                     transition_text = transition.get("text", "")
                     break
             
-            # 設置任務參數
-            task_id = f"{job_id}_transition_{i}_to_{i+1}"
+            # 設置任務參數 - 簡化命名方式，添加時間戳確保唯一性
+            timestamp = datetime.now().strftime("%H%M%S")
+            task_id = f"video_{i}_{i+1}_{timestamp}"
             
             # 設置任務時長（基於節點時間差）
             time_range = None
@@ -290,14 +506,21 @@ def create_tasks_from_storyboard(storyboard_file):
             if time_range and len(time_range) >= 2:
                 second_length = max(1, time_range[1] - time_range[0])
             
+            # 獲取節點的 seed（使用結束節點的 seed，因為那是要生成的目標）
+            node_seed = end_node.get("seed")
+            if node_seed is None:
+                node_seed = default_params["seed"]  # 使用預設 seed 如果未指定
+            
             # 創建任務
             task = {
                 "id": task_id,
                 "start_image": start_image_path,
                 "end_image": end_image_path,
+                "project_folder": project_folder,  # 加入專案資料夾路徑
                 "params": {
                     "prompt": f"Character movement: {transition_text}" if transition_text else default_params["prompt"],
-                    "total_second_length": second_length
+                    "total_second_length": second_length,
+                    "seed": node_seed  # 包含節點的 seed
                 }
             }
             
@@ -315,7 +538,7 @@ def create_tasks_from_storyboard(storyboard_file):
             
             logger.info(f"創建任務 {task_id}，從節點 {i} 到節點 {i+1}")
         
-        return {"success": True, "task_ids": task_ids}
+        return {"success": True, "task_ids": task_ids, "project_folder": project_folder}
         
     except Exception as e:
         logger.error(f"從故事板創建任務時出錯: {e}")
@@ -375,8 +598,54 @@ class StoryboardHandler(http.server.SimpleHTTPRequestHandler):
             
             self.wfile.write(response.encode('utf-8'))
             return
+
+        # 新增：查詢預覽生成任務狀態
+        elif path.startswith('/preview_status'):
+            query = urllib.parse.parse_qs(parsed_path.query)
+            job_id = query.get('id', [''])[0]
+
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+
+            task = task_status.get(job_id)
+            if task:
+                response = json.dumps({'status': 'success', 'task': task})
+            else:
+                response = json.dumps({'status': 'error', 'message': '找不到任務'})
+            self.wfile.write(response.encode('utf-8'))
+            return
+
+        # 取消預覽任務
+        elif path.startswith('/cancel_preview'):
+            query = urllib.parse.parse_qs(parsed_path.query)
+            job_id = query.get('id', [''])[0]
+
+            if not job_id:
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps({'status': 'error', 'message': '缺少任務ID'}).encode('utf-8'))
+                return
+
+            if job_id in task_status and task_status[job_id]['status'] == 'processing':
+                preview_cancel_flags[job_id] = True
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps({'status': 'success', 'message': '已請求取消'}).encode('utf-8'))
+            else:
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps({'status': 'success', 'message': '任務不在處理中或已完成'}).encode('utf-8'))
+            return
             
-        # 列出所有故事板JSON文件
+        # 列出所有故事板JSON文件（只從專案資料夾中搜尋）
         elif path == '/list_storyboards':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
@@ -385,16 +654,26 @@ class StoryboardHandler(http.server.SimpleHTTPRequestHandler):
             
             try:
                 files = []
-                for filename in os.listdir(JSON_OUTPUT_DIR):
-                    if filename.endswith('.json'):
-                        file_path = os.path.join(JSON_OUTPUT_DIR, filename)
-                        file_stats = os.stat(file_path)
-                        files.append({
-                            'filename': filename,
-                            'path': file_path,
-                            'size': file_stats.st_size,
-                            'modified': datetime.fromtimestamp(file_stats.st_mtime).isoformat()
-                        })
+                
+                # 只搜尋專案資料夾中的 JSON 文件（新格式：Xnodes_YYYYMMDD_HHMMSS 或舊格式：storyboard_YYYYMMDD_HHMMSS）
+                for item in os.listdir(OUTPUT_DIR):
+                    if ('nodes_' in item or item.startswith('storyboard_')) and os.path.isdir(os.path.join(OUTPUT_DIR, item)):
+                        project_path = os.path.join(OUTPUT_DIR, item)
+                        # 在每個專案資料夾中搜尋 JSON 文件
+                        for filename in os.listdir(project_path):
+                            if filename.endswith('.json'):
+                                file_path = os.path.join(project_path, filename)
+                                file_stats = os.stat(file_path)
+                                files.append({
+                                    'filename': filename,
+                                    'path': file_path,
+                                    'project_folder': item,
+                                    'size': file_stats.st_size,
+                                    'modified': datetime.fromtimestamp(file_stats.st_mtime).isoformat()
+                                })
+                
+                # 按修改時間排序（最新的在前）
+                files.sort(key=lambda x: x['modified'], reverse=True)
                 
                 response = json.dumps({
                     'status': 'success',
@@ -434,15 +713,25 @@ class StoryboardHandler(http.server.SimpleHTTPRequestHandler):
                 self.wfile.write(json.dumps(response_data).encode('utf-8'))
                 return
 
-            file_path = os.path.join(JSON_OUTPUT_DIR, filename)
+            # 只在專案資料夾中搜尋文件
+            file_path = None
+            project_folder = None
+            
+            # 在專案資料夾中搜尋文件（新格式：Xnodes_YYYYMMDD_HHMMSS 或舊格式：storyboard_YYYYMMDD_HHMMSS）
+            for item in os.listdir(OUTPUT_DIR):
+                if ('nodes_' in item or item.startswith('storyboard_')) and os.path.isdir(os.path.join(OUTPUT_DIR, item)):
+                    candidate_path = os.path.join(OUTPUT_DIR, item, filename)
+                    if os.path.exists(candidate_path):
+                        file_path = candidate_path
+                        project_folder = item
+                        break
 
-            if not os.path.exists(file_path):
+            if not file_path:
                 self.send_response(404)
                 self.send_header('Content-type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
-                # logger.info(f"Debug: Attempting to load file from: {os.path.abspath(file_path)}")
-                response_data = {"status": "error", "message": f"Storyboard file '{filename}' not found at path: {file_path}"}
+                response_data = {"status": "error", "message": f"Storyboard file '{filename}' not found in any project folder"}
                 self.wfile.write(json.dumps(response_data).encode('utf-8'))
                 return
             
@@ -450,11 +739,49 @@ class StoryboardHandler(http.server.SimpleHTTPRequestHandler):
                 with open(file_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 
+                # 處理圖片路徑 - 從專案資料夾的 images 載入
+                project_image_folder = os.path.join(OUTPUT_DIR, project_folder, "images")
+                logger.info(f"載入專案圖片資料夾: {project_image_folder}")
+                
+                # 列出資料夾中的所有文件用於調試
+                if os.path.exists(project_image_folder):
+                    available_images = os.listdir(project_image_folder)
+                    logger.info(f"專案圖片資料夾中的文件: {available_images}")
+                else:
+                    logger.warning(f"專案圖片資料夾不存在: {project_image_folder}")
+                
+                for node in data.get('nodes', []):
+                    if node.get('imagePath'):
+                        # 嘗試直接使用 imagePath
+                        image_path = os.path.join(project_image_folder, node['imagePath'])
+                        
+                        # 如果直接路徑不存在，嘗試只使用文件名
+                        if not os.path.exists(image_path):
+                            basename = os.path.basename(node['imagePath'])
+                            image_path = os.path.join(project_image_folder, basename)
+                            logger.info(f"嘗試使用基本文件名: {basename}")
+                        
+                        if os.path.exists(image_path):
+                            try:
+                                with open(image_path, 'rb') as img_file:
+                                    image_data = base64.b64encode(img_file.read()).decode('utf-8')
+                                    node['imageData'] = image_data
+                                    node['imageType'] = 'image/png'
+                                    # 保留 imagePath 以便識別，但前端會使用 imageData
+                                    logger.info(f"成功載入節點 {node.get('index')} 的圖片: {node['imagePath']} -> {image_path}")
+                            except Exception as e:
+                                logger.error(f"讀取圖片失敗 {image_path}: {e}")
+                        else:
+                            logger.warning(f"專案圖片文件不存在: {image_path} (原始路徑: {node['imagePath']})")
+                
+                # 添加專案資料夾信息到回應中
+                data['project_folder'] = os.path.join(OUTPUT_DIR, project_folder) if project_folder else None
+                
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
-                self.wfile.write(json.dumps(data).encode('utf-8')) # 直接返回JSON檔案的內容
+                self.wfile.write(json.dumps(data).encode('utf-8'))
             
             except json.JSONDecodeError as e:
                 self.send_response(500)
@@ -472,12 +799,22 @@ class StoryboardHandler(http.server.SimpleHTTPRequestHandler):
                 self.wfile.write(json.dumps(response_data).encode('utf-8'))
             return
         
-        # 視頻文件提供
+        # 視頻文件提供（支援專案資料夾結構）
         elif path.startswith('/video/'):
             video_name = path.replace('/video/', '')
-            video_path = os.path.join(VIDEO_OUTPUT_DIR, video_name)
+            video_path = None
             
-            if os.path.exists(video_path):
+            # 搜索專案資料夾中的影片文件（新格式：Xnodes_YYYYMMDD_HHMMSS 或舊格式：storyboard_YYYYMMDD_HHMMSS）
+            for item in os.listdir(OUTPUT_DIR):
+                if 'nodes_' in item or item.startswith('storyboard_'):
+                    project_path = os.path.join(OUTPUT_DIR, item)
+                    if os.path.isdir(project_path):
+                        candidate_path = os.path.join(project_path, video_name)
+                        if os.path.exists(candidate_path):
+                            video_path = candidate_path
+                            break
+            
+            if video_path and os.path.exists(video_path):
                 self.send_response(200)
                 content_type = mimetypes.guess_type(video_path)[0] or 'application/octet-stream'
                 self.send_header('Content-type', content_type)
@@ -504,24 +841,22 @@ class StoryboardHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
     
     def do_POST(self):
-        # 處理儲存故事板的請求
+        # 處理儲存故事板的請求 - 新邏輯：只做驗證，不保存文件
         if self.path == '/save_storyboard':
             content_length = int(self.headers['Content-Length'])
             post_data = self.rfile.read(content_length)
             
             try:
-                # 解析 JSON 資料
+                # 解析 JSON 資料（只做驗證）
                 data = json.loads(post_data.decode('utf-8'))
                 logger.info(f"收到故事板資料: {len(data['nodes'])} 個節點")
                 
                 # 檢查是否至少有兩個節點
                 if len(data['nodes']) < 2:
-                    
-                    self.send_response(400)  # Bad Request
+                    self.send_response(400)
                     self.send_header('Content-type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')  # CORS 支持
+                    self.send_header('Access-Control-Allow-Origin', '*')
                     self.end_headers()
-                    
                     response = json.dumps({
                         'status': 'error',
                         'message': "Storyboard needs at least 2 nodes to create transitions. Please add more nodes."
@@ -532,18 +867,19 @@ class StoryboardHandler(http.server.SimpleHTTPRequestHandler):
                 # 檢查所有節點是否都有圖片
                 missing_images = []
                 for i, node in enumerate(data['nodes']):
-                    if not node.get('hasImage', False) or ('imageData' not in node and 'imagePath' not in node):
+                    has_image = node.get('hasImage', False)
+                    has_image_data = 'imageData' in node
+                    has_image_path = 'imagePath' in node
+                    
+                    if not has_image or (not has_image_data and not has_image_path):
                         missing_images.append(i)
                 
-                # 如果有節點缺少圖片，拒絕保存
                 if missing_images:
                     nodes_str = ", ".join([str(i) for i in missing_images])
-                    
-                    self.send_response(400)  # Bad Request
+                    self.send_response(400)
                     self.send_header('Content-type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')  # CORS 支持
+                    self.send_header('Access-Control-Allow-Origin', '*')
                     self.end_headers()
-                    
                     response = json.dumps({
                         'status': 'error',
                         'message': f"Nodes {nodes_str} are missing images. Please add images to all nodes before saving."
@@ -551,52 +887,14 @@ class StoryboardHandler(http.server.SimpleHTTPRequestHandler):
                     self.wfile.write(response.encode('utf-8'))
                     return
                 
-                # 使用提供的檔名或生成新檔名
-                file_name = data.get('file_name')
-                if not file_name:
-                    now = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    file_name = f"{len(data['nodes'])}_{now}.json"
-                
-                # 檔案完整路徑
-                file_path = os.path.join(JSON_OUTPUT_DIR, file_name)
-                
-                # 處理圖片資料 (如果有的話)
-                for node in data['nodes']:
-                    if 'imageData' in node and 'imageType' in node:
-                        # 儲存圖片到單獨的檔案
-                        image_file_name = f"node_{node['index']}_{file_name.split('.')[0]}.png"
-                        image_path = os.path.join(IMAGE_OUTPUT_DIR, image_file_name)
-                        
-                        # 解碼 base64 並儲存圖片
-                        try:
-                            with open(image_path, 'wb') as img_file:
-                                img_file.write(base64.b64decode(node['imageData']))
-                            
-                            # 修改這裡: 直接使用圖片文件名作為路徑，避免多層嵌套路徑
-                            # 在 JSON 中替換 base64 資料為檔案路徑
-                            node['imagePath'] = image_file_name  # 只存儲文件名，不包含路徑
-                            del node['imageData']
-                            del node['imageType']
-                            logger.info(f"儲存節點 {node['index']} 的圖片: {image_file_name}")
-                        except Exception as e:
-                            logger.error(f"儲存圖片時發生錯誤: {e}")
-                
-                # 儲存 JSON 檔案
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-                
-                logger.info(f"故事板資料已儲存到: {file_path}")
-                
-                # 回傳成功訊息
+                # 只返回成功，不保存任何文件
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')  # CORS 支持
+                self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
-                
                 response = json.dumps({
                     'status': 'success',
-                    'message': 'Storyboard data saved successfully',
-                    'file_path': file_path
+                    'message': 'Storyboard validated successfully'
                 })
                 self.wfile.write(response.encode('utf-8'))
                 
@@ -606,45 +904,74 @@ class StoryboardHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_header('Content-type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
-                
                 response = json.dumps({
                     'status': 'error',
                     'message': str(e)
                 })
                 self.wfile.write(response.encode('utf-8'))
         
-        # 處理從故事板創建視頻任務的請求
+        # 處理從故事板創建視頻任務的請求 - 新邏輯：接收完整數據並立即創建專案
         elif self.path == '/process_storyboard':
             content_length = int(self.headers['Content-Length'])
             post_data = self.rfile.read(content_length)
             
             try:
                 data = json.loads(post_data.decode('utf-8'))
-                storyboard_file = data.get('storyboard_file')
                 
-                if not storyboard_file:
-                    raise ValueError("No storyboard file path provided")
+                # 新邏輯：接收完整的 storyboard 數據，而不是文件路徑
+                storyboard_data = data.get('storyboard_data')
+                if not storyboard_data:
+                    raise ValueError("No storyboard data provided")
                 
-                # 處理相對路徑
-                if not os.path.isabs(storyboard_file):
-                    storyboard_file = os.path.join(JSON_OUTPUT_DIR, storyboard_file)
+                # 立即創建專案資料夾 - 包含時間和節點個數
+                project_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                node_count = len(storyboard_data.get('nodes', []))
+                project_folder = os.path.join(OUTPUT_DIR, f"{node_count}nodes_{project_timestamp}")
+                project_image_folder = create_project_structure(project_folder)
                 
-                if not os.path.exists(storyboard_file):
-                    raise FileNotFoundError(f"Storyboard file not found: {storyboard_file}")
+                # 生成 JSON 文件名
+                json_filename = f"storyboard_{project_timestamp}.json"
+                project_json_path = os.path.join(project_folder, json_filename)
                 
-                # 創建任務
-                result = create_tasks_from_storyboard(storyboard_file)
+                # 處理並保存圖片到專案資料夾
+                for node in storyboard_data.get('nodes', []):
+                    if 'imageData' in node and 'imageType' in node:
+                        # 生成圖片文件名
+                        image_filename = f"node_{node['index']}_{project_timestamp}.png"
+                        image_path = os.path.join(project_image_folder, image_filename)
+                        
+                        # 保存圖片
+                        try:
+                            with open(image_path, 'wb') as img_file:
+                                img_file.write(base64.b64decode(node['imageData']))
+                            
+                            # 更新節點數據
+                            node['imagePath'] = image_filename
+                            del node['imageData']
+                            del node['imageType']
+                            logger.info(f"保存圖片到專案: {image_filename}")
+                        except Exception as e:
+                            logger.error(f"保存圖片失敗: {e}")
+                
+                # 保存 JSON 到專案資料夾
+                with open(project_json_path, 'w', encoding='utf-8') as f:
+                    json.dump(storyboard_data, f, ensure_ascii=False, indent=2)
+                logger.info(f"保存 JSON 到專案: {project_json_path}")
+                
+                # 現在使用專案中的 JSON 創建任務
+                result = create_tasks_from_storyboard(project_json_path)
                 
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')  # CORS 支持
+                self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
                 
                 if result.get("success", False):
                     response = json.dumps({
                         'status': 'success',
                         'message': f'Created {len(result["task_ids"])} video tasks',
-                        'task_ids': result["task_ids"]
+                        'task_ids': result["task_ids"],
+                        'project_folder': project_folder
                     })
                 else:
                     response = json.dumps({
@@ -661,12 +988,197 @@ class StoryboardHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_header('Content-type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
-                
                 response = json.dumps({
                     'status': 'error',
                     'message': str(e)
                 })
                 self.wfile.write(response.encode('utf-8'))
+        
+        # 重新生成影片（在現有專案資料夾內）
+        elif self.path == '/regenerate_video':
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            
+            try:
+                data = json.loads(post_data.decode('utf-8'))
+                project_folder = data.get('project_folder')
+                nodes = data.get('nodes', [])
+                transitions = data.get('transitions', [])
+                
+                logger.info(f"重生請求: project_folder={project_folder}")
+                logger.info(f"重生請求: nodes數量={len(nodes)}, transitions數量={len(transitions)}")
+                
+                if not project_folder:
+                    raise ValueError("No project folder provided")
+                
+                if not os.path.exists(project_folder):
+                    raise ValueError(f"Project folder does not exist: {project_folder}")
+                
+                logger.info(f"專案資料夾存在: {project_folder}")
+                
+                # 直接從提供的節點和轉場數據創建任務
+                result = create_tasks_from_nodes_and_transitions_direct(nodes, transitions, project_folder)
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                
+                if result.get("success", False):
+                    response = json.dumps({
+                        'status': 'success',
+                        'message': f'Created {len(result["task_ids"])} regeneration tasks',
+                        'task_ids': result["task_ids"]
+                    })
+                else:
+                    response = json.dumps({
+                        'status': 'error',
+                        'message': result.get("message", "Unknown error occurred")
+                    })
+                    
+                self.wfile.write(response.encode('utf-8'))
+                
+            except Exception as e:
+                logger.error(f"重新生成影片請求時發生錯誤: {e}")
+                traceback.print_exc()
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                response = json.dumps({
+                    'status': 'error',
+                    'message': str(e)
+                })
+                self.wfile.write(response.encode('utf-8'))
+        
+        # 新增：處理生成節點圖片的請求（僅打印訊息）
+        elif self.path == '/generate_node_image':
+            try:
+                content_length = int(self.headers.get('Content-Length', '0'))
+                post_data = self.rfile.read(content_length) if content_length > 0 else b'{}'
+                payload = json.loads(post_data.decode('utf-8') or '{}')
+                node_index = payload.get('node_index')
+                prev_node_index = payload.get('prev_node_index')
+                has_prev_image = payload.get('has_prev_image')
+                transition_text = payload.get('transition_text', '')
+                duration_seconds = float(payload.get('duration_seconds', 1.0))
+                # Debug: 印出時間差到 console
+                logger.info(f"[Generate] duration_seconds={duration_seconds}")
+
+                # 驗證：需要有前一張圖片
+                if not has_prev_image:
+                    self.send_response(400)
+                    self.send_header('Content-type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    resp = json.dumps({'status': 'error', 'message': '前一節點沒有圖片，無法生成。'})
+                    self.wfile.write(resp.encode('utf-8'))
+                    return
+
+                # 解析前一張圖片：使用 base64 數據
+                prev_image_file = None
+                try:
+                    if payload.get('prev_image_data') and payload.get('prev_image_type'):
+                        # base64 儲存成暫存檔
+                        import tempfile
+                        fname = f"prev_tmp_{int(time.time())}.png"
+                        candidate = os.path.join(tempfile.gettempdir(), fname)
+                        with open(candidate, 'wb') as f:
+                            f.write(base64.b64decode(payload['prev_image_data']))
+                        prev_image_file = candidate
+                except Exception as e:
+                    logger.error(f"解析前一張圖片失敗: {e}")
+
+                if not prev_image_file or not os.path.exists(prev_image_file):
+                    self.send_response(400)
+                    self.send_header('Content-type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    resp = json.dumps({'status': 'error', 'message': '找不到或無法保存前一張圖片。'})
+                    self.wfile.write(resp.encode('utf-8'))
+                    return
+
+                # 調用生成預覽單幀腳本函式
+                try:
+                    from generate_preview import generate_one_frame
+                except Exception as e:
+                    logger.error(f"載入 generate_preview 失敗: {e}")
+                    self.send_response(500)
+                    self.send_header('Content-type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    resp = json.dumps({'status': 'error', 'message': '後端未安裝生成模組'})
+                    self.wfile.write(resp.encode('utf-8'))
+                    return
+
+                # 建立預覽任務 ID 與狀態
+                job_id = f"preview_{uuid.uuid4().hex}"
+                task_status[job_id] = {
+                    'status': 'processing',
+                    'progress': 0,
+                    'message': '開始生成圖片...',
+                    'created_at': datetime.now().isoformat()
+                }
+                preview_cancel_flags[job_id] = False
+
+                def progress_cb(pct, msg):
+                    task_status[job_id]['progress'] = int(pct)
+                    task_status[job_id]['message'] = str(msg)
+
+                def cancel_cb():
+                    return preview_cancel_flags.get(job_id, False)
+
+                def run_job():
+                    try:
+                        # 使用系統暫存目錄生成圖片，不保存到輸出資料夾
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
+                            tmp_image_path = tmp_file.name
+                        
+                        prompt_text = transition_text or ''
+                        generate_one_frame(prev_image_file, prompt_text, tmp_image_path, progress_cb=progress_cb, cancel_cb=cancel_cb, duration_seconds=duration_seconds)
+                        
+                        # 讀取生成的圖片並轉換為 base64，直接返回給前端
+                        with open(tmp_image_path, 'rb') as img_file:
+                            import base64
+                            image_data = base64.b64encode(img_file.read()).decode('utf-8')
+                        
+                        # 清理暫存檔案
+                        try:
+                            os.unlink(tmp_image_path)
+                        except:
+                            pass
+                        
+                        task_status[job_id]['status'] = 'completed'
+                        task_status[job_id]['progress'] = 100
+                        task_status[job_id]['message'] = '生成完成。'
+                        task_status[job_id]['image_data'] = image_data
+                        task_status[job_id]['image_type'] = 'image/png'
+                    except Exception as e:
+                        # 依照取消旗標判定狀態
+                        if preview_cancel_flags.get(job_id, False):
+                            task_status[job_id]['status'] = 'cancelled'
+                            task_status[job_id]['message'] = '已取消生成'
+                        else:
+                            task_status[job_id]['status'] = 'error'
+                            task_status[job_id]['message'] = f'生成失敗: {str(e)}'
+
+                threading.Thread(target=run_job, daemon=True).start()
+
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                resp = json.dumps({'status': 'queued', 'job_id': job_id, 'message': '已開始生成圖片'})
+                self.wfile.write(resp.encode('utf-8'))
+            except Exception as e:
+                logger.error(f"處理生成圖片請求時發生錯誤: {e}")
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                resp = json.dumps({'status': 'error', 'message': str(e)})
+                self.wfile.write(resp.encode('utf-8'))
         
         else:
             # 其他 POST 請求返回 404

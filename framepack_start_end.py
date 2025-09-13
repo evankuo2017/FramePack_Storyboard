@@ -26,9 +26,8 @@ from transformers import SiglipImageProcessor, SiglipVisionModel
 from diffusers_helper.clip_vision import hf_clip_vision_encode
 from diffusers_helper.bucket_tools import find_nearest_bucket
 
-# 全局變數
-outputs_folder = './storyboard_outputs/video_output'
-os.makedirs(outputs_folder, exist_ok=True)
+# 全局變數 - 移除固定的 video_output 資料夾創建
+# outputs_folder 現在由 process_video 函數的 output 參數動態決定
 
 # 模型緩存
 _models = None
@@ -180,7 +179,10 @@ def process_video(start_image_path, end_image_path=None, progress_callback=None,
         'gpu_memory_preservation': 6,
         'use_teacache': True,
         'mp4_crf': 16,
-        'output': None
+        'output': None,
+        # 預覽模式：只生成最後一幀並輸出圖片
+        'preview_last_only': False,
+        'preview_image_output': None,
     }
     
     # 更新參數
@@ -192,6 +194,9 @@ def process_video(start_image_path, end_image_path=None, progress_callback=None,
     # 計算總潛在區段數
     total_latent_sections = (params['total_second_length'] * 30) / (params['latent_window_size'] * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"[FramePack] total_second_length={params['total_second_length']}, total_latent_sections={total_latent_sections}")
     
     # 生成任務ID
     job_id = generate_timestamp()
@@ -243,7 +248,7 @@ def process_video(start_image_path, end_image_path=None, progress_callback=None,
         height, width = find_nearest_bucket(H, W, resolution=640)
         input_image_np = resize_and_center_crop(input_image_np, target_width=width, target_height=height)
         
-        Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}_start.png'))
+        # 不再保存臨時的起始圖片檔案
         
         input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
         input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
@@ -277,7 +282,7 @@ def process_video(start_image_path, end_image_path=None, progress_callback=None,
             
             end_image_np = resize_and_center_crop(end_image_np, target_width=width, target_height=height)
             
-            Image.fromarray(end_image_np).save(os.path.join(outputs_folder, f'{job_id}_end.png'))
+            # 不再保存臨時的結束圖片檔案
             
             end_image_pt = torch.from_numpy(end_image_np).float() / 127.5 - 1
             end_image_pt = end_image_pt.permute(2, 0, 1)[None, :, None]
@@ -442,13 +447,37 @@ def process_video(start_image_path, end_image_path=None, progress_callback=None,
             if params['output']:
                 output_filename = params['output']
             else:
-                output_filename = os.path.join(outputs_folder, f'{job_id}.mp4')
+                # 如果沒有指定輸出路徑，使用臨時文件
+                import tempfile
+                output_filename = os.path.join(tempfile.gettempdir(), f'{job_id}.mp4')
             
+            # 預覽模式：在第一個section（對應最後時間段）完成後立即輸出最後一幀
+            if params['preview_last_only'] and is_first_section:
+                # 直接輸出最後一幀為圖片
+                try:
+                    frame = history_pixels[0, :, -1, :, :]  # C,H,W
+                    frame = frame.clamp(-1, 1)
+                    frame = (frame + 1.0) / 2.0  # [0,1]
+                    frame = (frame * 255.0).round().byte().permute(1, 2, 0).cpu().numpy()
+                    img = Image.fromarray(frame)
+                    if params['preview_image_output']:
+                        img_out = params['preview_image_output']
+                    else:
+                        # 使用臨時目錄作為預覽圖片輸出
+                        import tempfile
+                        img_out = os.path.join(tempfile.gettempdir(), f'{job_id}_preview.png')
+                    img.save(img_out)
+                    print(f"預覽模式：在第一個section完成後立即輸出最後一幀到 {img_out}")
+                    return img_out
+                except Exception as e:
+                    print(f"保存預覽單幀失敗: {e}")
+                    # 回退到保存視頻
+
             print(f"保存視頻到 {output_filename}...")
             save_bcthw_as_mp4(history_pixels, output_filename, fps=30, crf=params['mp4_crf'])
-            
+
             print(f'Decoded. Current latent shape {real_history_latents.shape}; pixel shape {history_pixels.shape}')
-            
+
             if is_last_section:
                 print(f"視頻生成完成！")
                 return output_filename
