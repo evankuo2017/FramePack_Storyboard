@@ -773,6 +773,33 @@ class StoryboardHandler(http.server.SimpleHTTPRequestHandler):
                                 logger.error(f"讀取圖片失敗 {image_path}: {e}")
                         else:
                             logger.warning(f"專案圖片文件不存在: {image_path} (原始路徑: {node['imagePath']})")
+                    else:
+                        # 如果沒有 imagePath，嘗試根據節點索引尋找圖片
+                        node_index = node.get('index', 0)
+                        # 嘗試多種可能的檔案名稱模式
+                        # 從專案資料夾名稱提取時間戳
+                        project_timestamp = project_folder.split('_', 1)[1] if '_' in project_folder else datetime.now().strftime("%Y%m%d_%H%M%S")
+                        possible_names = [
+                            f"node_{node_index}_{project_timestamp}.png",
+                            f"node_{node_index}.png",
+                            f"{node_index}.png"
+                        ]
+                        
+                        for possible_name in possible_names:
+                            image_path = os.path.join(project_image_folder, possible_name)
+                            if os.path.exists(image_path):
+                                try:
+                                    with open(image_path, 'rb') as img_file:
+                                        image_data = base64.b64encode(img_file.read()).decode('utf-8')
+                                        node['imageData'] = image_data
+                                        node['imageType'] = 'image/png'
+                                        node['imagePath'] = possible_name  # 設定 imagePath 供前端使用
+                                        logger.info(f"成功載入節點 {node_index} 的圖片（按索引尋找）: {possible_name}")
+                                        break
+                                except Exception as e:
+                                    logger.error(f"讀取圖片失敗 {image_path}: {e}")
+                        else:
+                            logger.warning(f"節點 {node_index} 沒有找到對應的圖片檔案")
                 
                 # 添加專案資料夾信息到回應中
                 data['project_folder'] = os.path.join(OUTPUT_DIR, project_folder) if project_folder else None
@@ -887,14 +914,40 @@ class StoryboardHandler(http.server.SimpleHTTPRequestHandler):
                     self.wfile.write(response.encode('utf-8'))
                     return
                 
-                # 只返回成功，不保存任何文件
+                # 創建專案資料夾並保存故事板檔案
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                node_count = len(data['nodes'])
+                
+                # 創建專案資料夾：Xnodes_YYYYMMDD_HHMMSS
+                project_folder_name = f"{node_count}nodes_{timestamp}"
+                project_folder_path = os.path.join(OUTPUT_DIR, project_folder_name)
+                
+                # 創建專案資料夾結構
+                project_image_folder = create_project_structure(project_folder_path)
+                
+                # 生成檔案名稱
+                filename = f"storyboard_{timestamp}.json"
+                file_path = os.path.join(project_folder_path, filename)
+                
+                # 保存故事板檔案到專案資料夾
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                
+                logger.info(f"專案已創建: {project_folder_path}")
+                logger.info(f"故事板檔案已保存: {file_path}")
+                
+                # 返回成功響應，包含專案和檔案信息
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
                 response = json.dumps({
                     'status': 'success',
-                    'message': 'Storyboard validated successfully'
+                    'message': 'Project created and storyboard saved successfully',
+                    'project_folder': project_folder_name,
+                    'project_path': project_folder_path,
+                    'file_path': file_path,
+                    'filename': filename
                 })
                 self.wfile.write(response.encode('utf-8'))
                 
@@ -918,20 +971,68 @@ class StoryboardHandler(http.server.SimpleHTTPRequestHandler):
             try:
                 data = json.loads(post_data.decode('utf-8'))
                 
-                # 新邏輯：接收完整的 storyboard 數據，而不是文件路徑
+                # 檢查是否有 storyboard_data（新格式）、project_folder（專案資料夾）或 storyboard_file（舊格式）
                 storyboard_data = data.get('storyboard_data')
-                if not storyboard_data:
-                    raise ValueError("No storyboard data provided")
+                project_folder = data.get('project_folder')
+                storyboard_file = data.get('storyboard_file')
                 
-                # 立即創建專案資料夾 - 包含時間和節點個數
-                project_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                node_count = len(storyboard_data.get('nodes', []))
-                project_folder = os.path.join(OUTPUT_DIR, f"{node_count}nodes_{project_timestamp}")
-                project_image_folder = create_project_structure(project_folder)
+                if storyboard_data:
+                    # 新邏輯：接收完整的 storyboard 數據
+                    logger.info("使用新邏輯：接收完整的 storyboard 數據")
+                elif project_folder:
+                    # 專案邏輯：從專案資料夾讀取數據
+                    logger.info(f"使用專案邏輯：從專案資料夾讀取數據 {project_folder}")
+                    # 構建專案資料夾路徑
+                    project_folder_path = os.path.join(OUTPUT_DIR, project_folder)
+                    if not os.path.exists(project_folder_path):
+                        raise ValueError(f"Project folder not found: {project_folder_path}")
+                    
+                    # 在專案資料夾中尋找 JSON 檔案
+                    json_files = [f for f in os.listdir(project_folder_path) if f.endswith('.json')]
+                    if not json_files:
+                        raise ValueError(f"No JSON file found in project folder: {project_folder_path}")
+                    
+                    # 讀取第一個 JSON 檔案（通常只有一個）
+                    storyboard_file_path = os.path.join(project_folder_path, json_files[0])
+                    with open(storyboard_file_path, 'r', encoding='utf-8') as f:
+                        storyboard_data = json.load(f)
+                    
+                    logger.info(f"從專案資料夾讀取檔案: {storyboard_file_path}")
+                elif storyboard_file:
+                    # 舊邏輯：從檔案路徑讀取數據
+                    logger.info(f"使用舊邏輯：從檔案讀取數據 {storyboard_file}")
+                    # 構建完整的檔案路徑
+                    storyboard_file_path = os.path.join(OUTPUT_DIR, storyboard_file)
+                    if not os.path.exists(storyboard_file_path):
+                        raise ValueError(f"Storyboard file not found: {storyboard_file_path}")
+                    
+                    # 讀取檔案內容
+                    with open(storyboard_file_path, 'r', encoding='utf-8') as f:
+                        storyboard_data = json.load(f)
+                else:
+                    raise ValueError("No storyboard data, project folder, or file provided")
                 
-                # 生成 JSON 文件名
+                # 確定專案資料夾路徑
+                if project_folder:
+                    # 如果已經有專案資料夾，直接使用
+                    project_folder_path = os.path.join(OUTPUT_DIR, project_folder)
+                    project_image_folder = os.path.join(project_folder_path, "images")
+                    # 從專案資料夾名稱提取時間戳
+                    if '_' in project_folder:
+                        project_timestamp = project_folder.split('_', 1)[1]
+                    else:
+                        project_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                else:
+                    # 如果沒有專案資料夾，創建新的
+                    project_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    node_count = len(storyboard_data.get('nodes', []))
+                    project_folder = f"{node_count}nodes_{project_timestamp}"
+                    project_folder_path = os.path.join(OUTPUT_DIR, project_folder)
+                    project_image_folder = create_project_structure(project_folder_path)
+                
+                # 生成 JSON 文件名（如果專案資料夾中沒有 JSON 檔案）
                 json_filename = f"storyboard_{project_timestamp}.json"
-                project_json_path = os.path.join(project_folder, json_filename)
+                project_json_path = os.path.join(project_folder_path, json_filename)
                 
                 # 處理並保存圖片到專案資料夾
                 for node in storyboard_data.get('nodes', []):

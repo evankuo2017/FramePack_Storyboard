@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Visual Storyboard v2.0</title>
+    <title>Visual Storyboard</title>
     <style>
         :root {
             --primary-color: #4361ee;
@@ -766,10 +766,9 @@
                     return null;
                 },
                 
-                // Creates and sends storyboard data to the backend - 新邏輯：直接處理，不再分兩步
+                // Creates and sends storyboard data to the backend
                 processStoryboard() {
-                    console.log('=== NEW FLOW v2.0: Processing storyboard with direct /process_storyboard call ===');
-                    console.log('State: Processing storyboard with new flow');
+                    console.log('State: Processing storyboard');
                     console.log('Current nodes for processing:', JSON.parse(JSON.stringify(this.nodes))); // 詳細打印節點狀態
 
                     if (this.nodes.length === 0) {
@@ -785,13 +784,6 @@
                         return message;
                     }
                     
-                    // 添加確認訊息
-                    const confirmProcess = confirm(`開始處理故事板，將創建 ${this.nodes.length} 個節點的專案並生成 ${this.nodes.length - 1} 個影片片段。是否繼續？`);
-                    if (!confirmProcess) {
-                        console.log('User cancelled storyboard processing');
-                        return "Processing cancelled by user.";
-                    }
-                    
                     // 檢查是否所有節點都有圖片
                     const missingImages = [];
                     for (let i = 0; i < this.nodes.length; i++) {
@@ -803,91 +795,89 @@
                     
                     if (missingImages.length > 0) {
                         const missingStr = missingImages.join(', ');
-                        const message = `Nodes ${missingStr} are missing images. Please add images to all nodes before processing.`;
+                        const message = `Nodes ${missingStr} are missing images. Please add images to all nodes before saving.`;
                         alert(message);
                         return message;
                     }
                     
-                    // 準備完整的 storyboard 數據
+                    // Create timestamp in format: YYYYMMDD_HHMMSS
+                    const now = new Date();
+                    const year = now.getFullYear();
+                    const month = String(now.getMonth() + 1).padStart(2, '0');
+                    const day = String(now.getDate()).padStart(2, '0');
+                    const hours = String(now.getHours()).padStart(2, '0');
+                    const minutes = String(now.getMinutes()).padStart(2, '0');
+                    const seconds = String(now.getSeconds()).padStart(2, '0');
+                    
+                    const timestamp = `${year}${month}${day}_${hours}${minutes}${seconds}`;
+                    // Generate filename: nodeCount_timestamp.json
+                    const fileName = `${this.nodes.length}_${timestamp}.json`;
+                    
+                    // Prepare data structure for output
                     const storyboardData = {
-                        job_id: new Date().toISOString().replace(/[:.]/g, '-'),
+                        job_id: timestamp,
                         nodes: [],
-                        transitions: []
+                        transitions: [],
+                        file_name: fileName // Add filename for backend use
                     };
                     
-                    // 處理所有節點
+                    // Process all nodes
                     for (let i = 0; i < this.nodes.length; i++) {
                         const node = this.nodes[i];
                         const nodeData = {
                             index: i,
                             time: node.time,
                             hasImage: node.hasImage,
-                            seed: node.seed
+                            seed: node.seed // 包含 seed 資訊
                         };
                         
-                        // 添加圖片數據
+                        // Add image data if present
                         if (node.hasImage && node.imageUrl) {
-                            if (node.imageUrl.startsWith('data:')) {
+                            if (node.imageUrl.startsWith('data:')) { // 如果是 base64 資料 URL
                                 const base64Data = node.imageUrl.split(',')[1];
                                 nodeData.imageData = base64Data;
-                                nodeData.imageType = node.imageUrl.split(';')[0].split(':')[1];
-                            } else if (node.imageUrl.includes('/storyboard_outputs/') || node.imageUrl.includes('/video/')) {
+                                nodeData.imageType = node.imageUrl.split(';')[0].split(':')[1]; // e.g., image/jpeg
+                            } else if (node.imageUrl.includes('/storyboard_outputs/image_output/')) { // 如果是伺服器上的圖片路徑
                                 // 從 imageUrl 中提取檔名作為 imagePath
                                 const parts = node.imageUrl.split('/');
-                                nodeData.imagePath = parts[parts.length - 1];
+                                nodeData.imagePath = parts[parts.length - 1]; // 取最後一部分作為檔名
                             }
                         }
                         
-                        // 添加轉場描述
-                        if (i > 0) {
-                            nodeData.transitionText = node.transitionText || "";
-                        }
-                        
                         storyboardData.nodes.push(nodeData);
-                    }
-                    
-                    // 處理轉場
-                    for (let i = 0; i < this.nodes.length - 1; i++) {
-                        const currentNode = this.nodes[i];
-                        const nextNode = this.nodes[i + 1];
                         
-                        const transitionData = {
-                            from_node: i,
-                            to_node: i + 1,
-                            text: currentNode.transitionText || "",
-                            time_range: [currentNode.time, nextNode.time]
-                        };
-                        storyboardData.transitions.push(transitionData);
+                        // Add transition to next node if it exists and not the last node
+                        if (i < this.nodes.length - 1) {
+                            const nextNode = this.nodes[i + 1];
+                            const transitionData = {
+                                from_node: i,
+                                to_node: i + 1,
+                                text: node.transitionText,
+                                time_range: [node.time, nextNode.time]
+                            };
+                            
+                            storyboardData.transitions.push(transitionData);
+                        }
                     }
                     
                     // Log the data being sent to the backend for debugging
-                    console.log("Data being sent to /process_storyboard:", JSON.parse(JSON.stringify(storyboardData)));
+                    console.log("Data being sent to /save_storyboard:", JSON.parse(JSON.stringify(storyboardData)));
 
                     // Show processing message
                     const currentOutputTextEl = document.getElementById('output-text');
                     if (currentOutputTextEl) {
-                        currentOutputTextEl.value = "Creating project and processing storyboard...";
+                        currentOutputTextEl.value = "Processing data and sending to backend...";
                     } else {
                         console.error("[State.processStoryboard] outputTextEl is null before fetch.");
                     }
                     
-                    // 顯示處理狀態區域
-                    document.getElementById('processing-status-container').style.display = 'block';
-                    
-                    // 暫時禁用按鈕，防止重複提交
-                    const processBtnEl = document.getElementById('process-btn');
-                    processBtnEl.disabled = true;
-                    processBtnEl.textContent = 'Creating Project...';
-                    
-                    // 直接發送到 /process_storyboard，不再經過 /save_storyboard
-                    fetch('/process_storyboard', {
+                    // Send data to Python backend
+                    fetch('/save_storyboard', {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
                         },
-                        body: JSON.stringify({
-                            storyboard_data: storyboardData
-                        })
+                        body: JSON.stringify(storyboardData)
                     })
                     .then(response => {
                         if (!response.ok) {
@@ -898,21 +888,83 @@
                         return response.json();
                     })
                     .then(data => {
-                        console.log('Processing response:', data);
+                        console.log('Success:', data);
+                        const saveMessage = `Processing successful! Total ${this.nodes.length} nodes.\n\n` +
+                                    `Project created: ${data.project_folder}\n` +
+                                    `JSON file saved as ${data.filename}\n` +
+                                    `Project path: ${data.project_path}`;
+                        const el = document.getElementById('output-text');
+                        if (el) {
+                            el.value = saveMessage;
+                        } else {
+                            console.error("[State.processStoryboard] outputTextEl is null in fetch.then.");
+                        }
                         
-                        // 重新啟用按鈕
-                        const processBtnEl = document.getElementById('process-btn');
-                        processBtnEl.disabled = false;
-                        processBtnEl.textContent = 'Process Storyboard';
+                        // 在保存成功後詢問是否立即處理視頻
+                        const confirmProcess = confirm("Project created and storyboard saved successfully! Do you want to start processing the video now?");
+                        
+                        if (confirmProcess) {
+                            // 顯示處理狀態區域
+                            document.getElementById('processing-status-container').style.display = 'block';
+                            
+                            // 開始處理視頻，使用專案資料夾名稱
+                            this.startVideoProcessing(data.project_folder);
+                        }
+                    })
+                    .catch(error => {
+                        console.error('Error:', error);
+                        const errorMessage = `Error: ${error.message}\n\n` +
+                                    `Please check if all nodes have images uploaded.`;
+                        const el = document.getElementById('output-text');
+                        if (el) {
+                            el.value = errorMessage;
+                        } else {
+                            console.error("[State.processStoryboard] outputTextEl is null in fetch.catch.");
+                        }
+                        alert(errorMessage);
+                    });
+                    
+                    return "Sending data to backend...";
+                },
+                
+                // 開始處理視頻（使用專案資料夾名稱）
+                startVideoProcessing(projectFolder) {
+                    console.log(`Starting video processing for project: ${projectFolder}`);
+                    const currentOutputTextEl = document.getElementById('output-text');
+                    if (currentOutputTextEl) {
+                        currentOutputTextEl.value += "\n\nStarting video processing...";
+                    } else {
+                        console.error("[State.startVideoProcessing] outputTextEl is null when starting video processing.");
+                    }
+                    
+                    fetch('/process_storyboard', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            project_folder: projectFolder
+                        })
+                    })
+                    .then(response => {
+                        if (!response.ok) {
+                            throw new Error(`HTTP error! Status: ${response.status}`);
+                        }
+                        return response.json();
+                    })
+                    .then(data => {
+                        console.log('Processing response:', data);
                         
                         if (data.status === 'success') {
                             const el = document.getElementById('output-text');
                             if (el) {
                                 const projectInfo = data.project_folder ? `\n專案資料夾: ${data.project_folder}` : '';
-                                el.value = `Project created and submitted ${data.task_ids.length} video processing tasks.${projectInfo}`;
+                                el.value += `\n\nSubmitted ${data.task_ids.length} video processing tasks.${projectInfo}`;
+                            } else {
+                                console.error("[State.startVideoProcessing] outputTextEl is null when submitting tasks.");
                             }
                             this.taskIds = data.task_ids;
-                            this.currentProjectFolder = data.project_folder;
+                            this.currentProjectFolder = data.project_folder; // 儲存專案資料夾信息
                             
                             // 顯示專案資料夾信息
                             if (data.project_folder) {
@@ -927,33 +979,37 @@
                             // 開始定期檢查任務狀態
                             this.startTaskStatusPolling();
                         } else {
+                            // 處理錯誤響應
                             const el = document.getElementById('output-text');
                             if (el) {
-                                el.value = `Processing failed: ${data.message}`;
+                                el.value += `\n\nSubmission failed: ${data.message}`;
+                            } else {
+                                console.error("[State.startVideoProcessing] outputTextEl is null on submission failure.");
                             }
+                            
+                            // 顯示錯誤訊息
                             alert(`Error: ${data.message}`);
-                            document.getElementById('processing-status-container').style.display = 'none';
+                            
+                            // 隱藏處理狀態區域（如果沒有成功的任務）
+                            if (this.taskIds.length === 0) {
+                                document.getElementById('processing-status-container').style.display = 'none';
+                            }
                         }
                     })
                     .catch(error => {
-                        console.error('Error:', error);
-                        
-                        // 重新啟用按鈕
-                        const processBtnEl = document.getElementById('process-btn');
-                        processBtnEl.disabled = false;
-                        processBtnEl.textContent = 'Process Storyboard';
-                        
+                        console.error('Processing request error:', error);
                         const el = document.getElementById('output-text');
                         if (el) {
-                            el.value = `Processing request error: ${error.message}`;
+                            el.value += `\n\nProcessing request error: ${error.message}`;
+                        } else {
+                            console.error("[State.startVideoProcessing] outputTextEl is null on request error.");
                         }
                         alert(`Error: ${error.message}`);
+                        
+                        // 隱藏處理狀態區域
                         document.getElementById('processing-status-container').style.display = 'none';
                     });
-                    
-                    return "Creating project and starting processing...";
                 },
-                
                 
                 // 開始輪詢任務狀態
                 startTaskStatusPolling() {
@@ -1079,20 +1135,15 @@
                             viewButton.className = 'button-primary';
                             viewButton.textContent = 'View';
                             viewButton.style.marginRight = '5px';
-                            viewButton.style.marginBottom = '8px';
                             viewButton.onclick = () => {
                                 this.viewVideoResult(task.output_file);
                             };
                             actionCell.appendChild(viewButton);
                             
-                            // 添加換行
-                            actionCell.appendChild(document.createElement('br'));
-                            
                             const regenerateButton = document.createElement('button');
                             regenerateButton.className = 'button-primary';
                             regenerateButton.textContent = 'Regenerate';
                             regenerateButton.style.backgroundColor = '#28a745';
-                            regenerateButton.style.marginTop = '5px';
                             regenerateButton.onclick = () => {
                                 this.regenerateVideo(taskId);
                             };
@@ -1197,104 +1248,90 @@
                     document.body.appendChild(dialog);
                 },
                 
-                // 重生影片（在當前專案內替換影片）
+                // 重生影片（保持 prompt 不變，隨機 seed）
                 regenerateVideo(taskId) {
-                    // 從 taskId 解析出節點索引 (格式: video_i_j_timestamp)
-                    const match = taskId.match(/video_(\d+)_(\d+)_/);
-                    if (!match) {
-                        alert("無法解析任務ID，無法重生影片。");
-                        return;
-                    }
-                    
-                    const fromNode = parseInt(match[1]);
-                    const toNode = parseInt(match[2]);
-                    
-                    const confirmRegenerate = confirm(`重生影片片段 ${fromNode} → ${toNode}，使用隨機 seed。是否繼續？`);
+                    const confirmRegenerate = confirm("重生影片會保持相同的 prompt，但使用隨機 seed。是否繼續？");
                     if (!confirmRegenerate) return;
                     
-                    // 檢查是否有當前專案資料夾
-                    if (!this.currentProjectFolder) {
-                        alert("沒有當前專案資料夾，無法重生影片。");
-                        return;
-                    }
+                    // 為所有節點生成新的隨機 seed
+                    this.nodes.forEach(node => {
+                        if (node.index > 0) { // 跳過第一個節點（不用於生成）
+                            node.seed = Math.floor(Math.random() * 2147483647);
+                        }
+                    });
                     
-                    // 檢查節點是否存在
-                    if (fromNode >= this.nodes.length || toNode >= this.nodes.length) {
-                        alert("節點索引超出範圍，無法重生影片。");
-                        return;
-                    }
+                    // 更新 UI 顯示新的 seed
+                    this.updateUI();
                     
-                    // 準備單一片段的節點和轉場數據
-                    const nodes = [];
-                    const transitions = [];
+                    // 重新處理 storyboard
+                    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                    const fileName = `${this.nodes.length}_${timestamp}_regenerate.json`;
                     
-                    // 只處理相關的兩個節點
-                    [fromNode, toNode].forEach(nodeIndex => {
-                        const node = this.nodes[nodeIndex];
-                        let imagePath = null;
+                    // 準備數據結構
+                    const storyboardData = {
+                        job_id: timestamp,
+                        nodes: [],
+                        transitions: [],
+                        file_name: fileName
+                    };
+                    
+                    // 處理所有節點
+                    for (let i = 0; i < this.nodes.length; i++) {
+                        const node = this.nodes[i];
+                        const nodeData = {
+                            index: i,
+                            time: node.time,
+                            hasImage: node.hasImage,
+                            seed: node.seed // 包含新的隨機 seed
+                        };
                         
-                        // 優先使用保存的原始文件名
-                        if (node.originalImagePath) {
-                            imagePath = node.originalImagePath;
-                        } else if (node.imageUrl) {
+                        // 添加圖片數據
+                        if (node.hasImage && node.imageUrl) {
                             if (node.imageUrl.startsWith('data:')) {
-                                imagePath = `node_${nodeIndex}.png`;
-                            } else {
-                                imagePath = node.imageUrl.split('/').pop();
+                                const base64Data = node.imageUrl.split(',')[1];
+                                nodeData.imageData = base64Data;
+                                nodeData.imageType = node.imageUrl.split(';')[0].split(':')[1];
+                            } else if (node.imageUrl.includes('/storyboard_outputs/image_output/')) {
+                                const segments = node.imageUrl.split('/');
+                                nodeData.imagePath = segments[segments.length - 1];
                             }
                         }
                         
-                        const nodeData = {
-                            index: nodeIndex,
-                            time: node.time,
-                            hasImage: node.hasImage,
-                            seed: nodeIndex === toNode ? Math.floor(Math.random() * 2147483647) : node.seed, // 只為目標節點生成隨機seed
-                            imagePath: imagePath
-                        };
-                        nodes.push(nodeData);
-                    });
+                        storyboardData.nodes.push(nodeData);
+                        
+                        // 添加轉場到下一個節點
+                        if (i < this.nodes.length - 1) {
+                            const nextNode = this.nodes[i + 1];
+                            const transitionData = {
+                                from_node: i,
+                                to_node: i + 1,
+                                text: node.transitionText,
+                                time_range: [node.time, nextNode.time]
+                            };
+                            storyboardData.transitions.push(transitionData);
+                        }
+                    }
                     
-                    // 創建單一轉場
-                    const fromNodeData = this.nodes[fromNode];
-                    const transitionData = {
-                        from_node: fromNode,
-                        to_node: toNode,
-                        text: fromNodeData.transitionText || ""
-                    };
-                    transitions.push(transitionData);
-                    
-                    console.log('重生單一片段:', {
-                        project_folder: this.currentProjectFolder,
-                        nodes: nodes,
-                        transitions: transitions
-                    });
-                    
-                    // 發送重生請求
-                    fetch('/regenerate_video', {
+                    // 發送到後端並開始處理
+                    fetch('/save_storyboard', {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
                         },
-                        body: JSON.stringify({
-                            project_folder: this.currentProjectFolder,
-                            nodes: nodes,
-                            transitions: transitions
-                        })
+                        body: JSON.stringify(storyboardData)
                     })
                     .then(response => response.json())
                     .then(data => {
                         if (data.status === 'success') {
-                            alert(`重生任務已提交：影片片段 ${fromNode} → ${toNode}`);
-                            // 不需要添加新的 task ID，直接更新現有任務的狀態顯示
-                            // 重新啟動狀態更新以反映重生任務的進度
-                            this.startTaskStatusUpdates();
+                            // 立即開始處理視頻，使用專案資料夾名稱
+                            this.startVideoProcessing(data.project_folder);
                         } else {
-                            alert(`重生失敗：${data.message}`);
+                            alert(`重生失敗: ${data.message}`);
                         }
                     })
                     .catch(error => {
-                        console.error('重生請求失敗:', error);
-                        alert('重生請求失敗，請檢查網路連接。');
+                        console.error('重生影片錯誤:', error);
+                        alert(`重生失敗: ${error.message}`);
                     });
                 },
                 
@@ -1634,13 +1671,43 @@
             }
 
             function processStoryboard() {
-                console.log('[GLOBAL FUNCTION] processStoryboard called. Attempting to call state.processStoryboard...');
-                const result = state.processStoryboard();
+                console.log('[GLOBAL FUNCTION] processStoryboard called. Showing confirmation dialog...');
                 
-                if (outputTextEl) {
-                    outputTextEl.value = result;
+                // 檢查是否有節點
+                if (state.nodes.length === 0) {
+                    alert('請先添加至少一個節點到故事板中。');
+                    return;
+                }
+                
+                // 檢查是否所有節點都有圖片
+                const missingImages = state.nodes.filter(node => !node.hasImage);
+                if (missingImages.length > 0) {
+                    const missingIndices = missingImages.map(node => node.index).join(', ');
+                    alert(`節點 ${missingIndices} 缺少圖片，請先上傳圖片。`);
+                    return;
+                }
+                
+                // 顯示確認對話框
+                const confirmMessage = `確定要建立專案並開始處理故事板嗎？\n\n` +
+                                    `節點數量: ${state.nodes.length}\n` +
+                                    `這將創建一個新的專案資料夾並開始視頻處理任務。`;
+                
+                const userConfirmed = confirm(confirmMessage);
+                
+                if (userConfirmed) {
+                    console.log('[GLOBAL FUNCTION] User confirmed. Calling state.processStoryboard...');
+                    const result = state.processStoryboard();
+                    
+                    if (outputTextEl) {
+                        outputTextEl.value = result;
+                    } else {
+                        console.error('[GLOBAL FUNCTION] outputTextEl is null. Cannot display result:', result);
+                    }
                 } else {
-                    console.error('[GLOBAL FUNCTION] outputTextEl is null. Cannot display result:', result);
+                    console.log('[GLOBAL FUNCTION] User cancelled process storyboard.');
+                    if (outputTextEl) {
+                        outputTextEl.value = '用戶取消了故事板處理。';
+                    }
                 }
             }
             
@@ -2329,17 +2396,15 @@
                                                 };
 
                                                 // 修正：更可靠地設定 hasImage 狀態
-                                                if (nodeData.imageData && nodeData.imageType) { // 優先處理 base64 圖片數據（從專案資料夾載入）
+                                                if (nodeData.imageData && nodeData.imageType) { // 優先使用 base64 圖片（後端已載入）
                                                     newNode.hasImage = true;
                                                     newNode.imageUrl = `data:${nodeData.imageType};base64,${nodeData.imageData}`;
-                                                    // 保存原始文件名以供重生功能使用
-                                                    newNode.originalImagePath = nodeData.imagePath;
                                                 } else if (nodeData.imagePath && typeof nodeData.imagePath === 'string' && nodeData.imagePath.trim() !== '') {
-                                                    // 舊格式的圖片路徑（向後兼容） - 但這應該不會被使用，因為新流程都會有 imageData
+                                                    // 如果沒有 base64 資料，嘗試從專案資料夾載入
                                                     newNode.hasImage = true;
-                                                    console.warn('使用舊格式的圖片路徑，這可能表示載入過程有問題:', nodeData.imagePath);
-                                                    newNode.imageUrl = `/storyboard_outputs/image_output/${nodeData.imagePath.trim()}`;
-                                                    newNode.originalImagePath = nodeData.imagePath.trim();
+                                                    // 使用專案資料夾路徑（後端會處理實際的檔案路徑）
+                                                    const projectFolder = storyboardData.project_folder ? storyboardData.project_folder.split('/').pop() : '';
+                                                    newNode.imageUrl = `/storyboard_outputs/${projectFolder}/images/${nodeData.imagePath.trim()}`;
                                                 } else {
                                                     newNode.hasImage = false; // 明確設為 false
                                                 }
